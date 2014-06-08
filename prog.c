@@ -59,7 +59,20 @@ static void print_errno(const char *fmt, ...)
         va_end(ap);
 
         fprintf(stderr, ": %s\n", strerror(errno));
-        exit(1);
+}
+
+static void print_err(const char *fmt, ...)
+	__attribute__ ((format (printf, 1, 2)));
+
+static void print_err(const char *fmt, ...)
+{
+        va_list ap;
+
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+
+	putc('\n', stderr);
 }
 
 static int write_file(const char *path, int ignore_ebusy,
@@ -265,7 +278,7 @@ static uint8_t *grow_hex(struct hex *hex, unsigned int len)
 	return data;
 }
 
-static void read_hex(const char *path, struct hex *hex)
+static int read_hex(const char *path, struct hex *hex)
 {
 	const int buf_size = 512 + 11 + 10;
 	char buf[buf_size];
@@ -276,9 +289,13 @@ static void read_hex(const char *path, struct hex *hex)
 	uint8_t count, b, csum, type;
 	uint16_t addr;
 	unsigned int next_addr = -1;
+	const char *msg;
 	FILE *fp = fopen(path, "r");
-	if (!fp)
-		die_errno("%s", path);
+
+	if (!fp) {
+		print_errno("%s", path);
+		goto err;
+	}
 
 	hex->origin = hex->len = 0;
 	hex->capacity = 512;
@@ -287,26 +304,34 @@ static void read_hex(const char *path, struct hex *hex)
 		die_alloc();
 
 	for (;;) {
-		if (feof(fp))
-			die("%s: missing EOF record", path);
+		if (feof(fp)) {
+			print_err("%s: missing EOF record", path);
+			goto err_close;
+		}
 
-		if (!fgets(buf, buf_size, fp) && ferror(fp))
-			die_errno("%s", path);
+		if (!fgets(buf, buf_size, fp) && ferror(fp)) {
+			print_errno("%s", path);
+			goto err_close;
+		}
 
 		l = strlen(buf);
+		msg = "truncated line";
 		if (l < 11)
-			die("%s:%d: short line", path, line);
+			goto err_format;
 
 		p = buf;
+		msg = "line does not start with ':'";
 		if (*p != ':')
-			die("%s:%d: line does not start with ':'", path, line);
+			goto err_format;
 
 		count = hex_byte(p += 1, path);
+		msg = "truncated line";
 		if (l < count * 2 + (size_t)11)
-			die("%s:%d: truncated line", path, line);
+			goto err_format;
 
+		msg = "excess characters";
 		if (!trailing_whitespace(buf + count * 2 + 11))
-			die("%s:%d: excess characters", path, line);
+			goto err_format;
 
 		csum = count;
 
@@ -323,9 +348,9 @@ static void read_hex(const char *path, struct hex *hex)
 				hex->origin = addr;
 			}
 			else if (addr != next_addr) {
+				msg = "decreasing address";
 				if (addr < next_addr)
-					die("%s:%d: decreasing address",
-					    path, line);
+					goto err_format;
 
 				memset(grow_hex(hex, addr - next_addr),
 				       0, addr - next_addr);
@@ -344,8 +369,9 @@ static void read_hex(const char *path, struct hex *hex)
 				csum += hex_byte(p += 2, path);
 		}
 
+		msg = "checksum incorrect";
 		if ((uint8_t)-csum != hex_byte(p += 2, path))
-			die("%s:%d: checksum error %x", path, line, csum);
+			goto err_format;
 
 		if (type == 1)
 			/* EOF record */
@@ -355,8 +381,19 @@ static void read_hex(const char *path, struct hex *hex)
 		line++;
 	}
 
-	if (fclose(fp))
-		die_errno("closing \"%s\"", path);
+	if (fclose(fp)) {
+		print_errno("closing \"%s\"", path);
+		goto err;
+	}
+
+	return 1;
+
+ err_format:
+	print_err("%s:%d: %s", path, line, msg);
+ err_close:
+	fclose(fp);
+ err:
+	return 0;
 }
 
 static void load_page(int spidev, uint8_t *data, unsigned int len)
@@ -496,28 +533,35 @@ int main(int argc, char **argv)
 	struct hex hex;
 	uint8_t tx[4], rx[4];
 
-	if (argc != 2)
-		die("usage: %s <hex file>", argv[0]);
+	hex.data = NULL;
 
-	read_hex(argv[1], &hex);
+	if (argc != 2) {
+		print_err("usage: %s <hex file>", argv[0]);
+		goto err;
+	}
+
+	if (!read_hex(argv[1], &hex))
+		goto err;
 
 	spidev = init_spidev();
 	if (spidev < 0)
 		goto err;
 
 	if (!resetn_low())
-		goto err;
+		goto err_close_spidev;
 
 	/* Try "Programming Enable" */
 	tx[0] = 0xac;
 	tx[1] = 0x53;
 	tx[2] = tx[3] = 0;
 	do_instruction(spidev, tx, rx);
-	if (rx[2] != 0x53)
+	if (rx[2] != 0x53) {
 		fprintf(stderr,
 			"Unacknowledged 'Programming Enable' instruction "
 			"(%02x %02x %02x %02x)\n",
 			rx[0], rx[1], rx[2], rx[3]);
+		goto err_close_spidev;
+	}
 
 	read_signature(spidev, rx);
 	fprintf(stderr, "Signature: %02x %02x %02x %02x\n",
@@ -528,7 +572,10 @@ int main(int argc, char **argv)
 	close(spidev);
 	return 0;
 
+ err_close_spidev:
+	close(spidev);
  err:
+	free(hex.data);
 	return 1;
 }
 
