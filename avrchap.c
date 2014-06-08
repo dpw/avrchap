@@ -220,7 +220,7 @@ static void read_signature(int fd, uint8_t sig[4])
 	}
 }
 
-static unsigned int hex_digit(unsigned char c, const char *path)
+static int hex_digit(unsigned char c, const char *path)
 {
 	if (c <= '9') {
 		if (c >= '0')
@@ -232,12 +232,23 @@ static unsigned int hex_digit(unsigned char c, const char *path)
 			return uc - 'A' + 10;
 	}
 
-	die("bad hex digit '%c' in \"%s\"", c, path);
+	print_err("bad hex digit '%c' in \"%s\"", c, path);
+	return -1;
 }
 
-static uint8_t hex_byte(const char *s, const char *path)
+static int hex_byte(const char *s, const char *path)
 {
-	return hex_digit(s[0], path) << 4 | hex_digit(s[1], path);
+	int hi, lo;
+
+	hi = hex_digit(s[0], path);
+	if (hi < 0)
+		return -1;
+
+	lo = hex_digit(s[1], path);
+	if (lo < 0)
+		return -1;
+
+	return hi << 4 | lo;
 }
 
 static int trailing_whitespace(const char *s)
@@ -286,9 +297,9 @@ static int read_hex(const char *path, struct hex *hex)
 	char *p;
 	uint8_t *data;
 	size_t l;
-	uint8_t count, b, csum, type;
-	uint16_t addr;
-	unsigned int next_addr = -1;
+	int count, b, type, addr;
+	uint8_t csum;
+	int next_addr = -1;
 	const char *msg;
 	FILE *fp = fopen(path, "r");
 
@@ -325,6 +336,9 @@ static int read_hex(const char *path, struct hex *hex)
 			goto err_format;
 
 		count = hex_byte(p += 1, path);
+		if (count < 0)
+			goto err_close;
+
 		msg = "truncated line";
 		if (l < count * 2 + (size_t)11)
 			goto err_format;
@@ -336,15 +350,24 @@ static int read_hex(const char *path, struct hex *hex)
 		csum = count;
 
 		b = hex_byte(p += 2, path);
+		if (b < 0)
+			goto err_close;
+
 		addr = hex_byte(p += 2, path);
+		if (addr < 0)
+			goto err_close;
+
 		csum += b + addr;
 		addr |= (uint16_t)b << 8;
 
 		type = hex_byte(p += 2, path);
+		if (type < 0)
+			goto err_close;
+
 		csum += type;
 		if (type == 0) {
 			/* Data record */
-			if (next_addr == (unsigned)-1) {
+			if (next_addr == -1) {
 				hex->origin = addr;
 			}
 			else if (addr != next_addr) {
@@ -360,17 +383,29 @@ static int read_hex(const char *path, struct hex *hex)
 			data = grow_hex(hex, count);
 			while (count--) {
 				b = hex_byte(p += 2, path);
+				if (b < 0)
+					goto err_close;
+
 				*data++ = b;
 				csum += b;
 			}
 		}
 		else {
-			while (count--)
-				csum += hex_byte(p += 2, path);
+			while (count--) {
+				b = hex_byte(p += 2, path);
+				if (b < 0)
+					goto err_close;
+
+				csum += b;
+			}
 		}
 
+		b = hex_byte(p += 2, path);
+		if (b < 0)
+			goto err_close;
+
 		msg = "checksum incorrect";
-		if ((uint8_t)-csum != hex_byte(p += 2, path))
+		if ((uint8_t)-csum != b)
 			goto err_format;
 
 		if (type == 1)
