@@ -1,4 +1,4 @@
-CFLAGS=-Wall -Wextra -Werror
+CFLAGS=-Wall -Wextra -Werror -g
 
 prog: prog.c
 	$(CC) $(CFLAGS) -o $@ $^
