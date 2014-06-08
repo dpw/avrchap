@@ -354,7 +354,9 @@ static void write_program(int spidev, struct hex *hex)
 	unsigned int addr, len;
 	uint8_t *data;
 
-	if (hex->len & 1)
+	data = hex->data;
+	len = hex->len;
+	if (len & 1)
 		die("Program is not a whole number of words");
 
 	addr = hex->origin;
@@ -362,9 +364,6 @@ static void write_program(int spidev, struct hex *hex)
 		die("Program does not start on page boundary");
 
 	fprintf(stderr, "Writing program: ");
-
-	len = hex->len;
-	data = hex->data;
 
 	while (len >= page_len) {
 		load_page(spidev, data, page_len);
@@ -382,6 +381,53 @@ static void write_program(int spidev, struct hex *hex)
 	}
 
 	putc('\n', stderr);
+}
+
+static void verify_program(int spidev, struct hex *hex)
+{
+	unsigned int addr, len;
+	uint8_t *data;
+	uint8_t tx[4], rx[4];
+
+	data = hex->data;
+	len = hex->len;
+	if (len & 1)
+		die("Program is not a whole number of words");
+
+	addr = hex->origin;
+
+	fprintf(stderr, "Verifying program: ");
+
+	while (len) {
+		if (!(len & 127))
+			putc('.', stderr);
+
+		tx[0] = 0x20;
+		tx[1] = addr >> 9;
+		tx[2] = addr >> 1;
+		tx[3] = 0;
+		do_instruction(spidev, tx, rx);
+		if (rx[3] != *data)
+			goto mismatch;
+
+		data++;
+		addr++;
+		tx[0] = 0x28;
+		do_instruction(spidev, tx, rx);
+		if (rx[3] != *data)
+			goto mismatch;
+
+		data++;
+		addr++;
+		len -= 2;
+	}
+
+	putc('\n', stderr);
+	return;
+
+ mismatch:
+	die("\nVerification error: Expected %x, got %x at address %x",
+	    *data, rx[3], addr);
 }
 
 int main(int argc, char **argv)
@@ -425,6 +471,7 @@ int main(int argc, char **argv)
 		rx[0], rx[1], rx[2], rx[3]);
 
 	write_program(spidev, &hex);
+	verify_program(spidev, &hex);
 	close(spidev);
 	return 0;
 }
