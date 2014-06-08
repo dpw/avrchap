@@ -1,6 +1,6 @@
 CFLAGS=-Wall -Wextra -Werror -g
 
-prog: prog.c
+avrchap: avrchap.c
 	$(CC) $(CFLAGS) -o $@ $^
 
 .PHONY: clean
