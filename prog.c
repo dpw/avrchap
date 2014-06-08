@@ -6,11 +6,17 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 
 #include <linux/spi/spidev.h>
+
+static void die(const char *fmt, ...)
+	__attribute__ ((noreturn,format (printf, 1, 2)));
+static void die_errno(const char *fmt, ...)
+	__attribute__ ((noreturn,format (printf, 1, 2)));
 
 static void die(const char *fmt, ...)
 {
@@ -33,6 +39,12 @@ static void die_errno(const char *fmt, ...)
 
         fprintf(stderr, ": %s\n", strerror(errno));
         exit(1);
+}
+
+static void die_alloc()
+{
+	fprintf(stderr, "failed to allocate memory\n");
+	exit(1);
 }
 
 static void write_file(const char *path, int ignore_ebusy,
@@ -135,13 +147,253 @@ static void read_signature(int fd, uint8_t sig[4])
 	}
 }
 
+static unsigned int hex_digit(unsigned char c, const char *path)
+{
+	if (c <= '9') {
+		if (c >= '0')
+			return c - '0';
+	}
+	else {
+		unsigned char uc = c & ~32U;
+		if (uc >= 'A' && uc <= 'F')
+			return uc - 'A' + 10;
+	}
+
+	die_errno("bad hex digit '%c' in \"%s\"", c, path);
+}
+
+static uint8_t hex_byte(const char *s, const char *path)
+{
+	return hex_digit(s[0], path) << 4 | hex_digit(s[1], path);
+}
+
+static int trailing_whitespace(const char *s)
+{
+	for (;;) {
+		char c = *s++;
+		if (c == 0)
+			return 1;
+
+		if (!isspace(c))
+			return 0;
+	}
+}
+
+struct hex {
+	unsigned int origin;
+	unsigned int len;
+	size_t capacity;
+	uint8_t *data;
+};
+
+static uint8_t *grow_hex(struct hex *hex, unsigned int len)
+{
+	uint8_t *data;
+
+	if (hex->len + len > hex->capacity) {
+		do {
+			hex->capacity *= 2;
+		} while (hex->len + len > hex->capacity);
+
+		hex->data = realloc(hex->data, hex->capacity);
+		if (!hex->data)
+			die_alloc();
+	}
+
+	data = hex->data + hex->len;
+	hex->len += len;
+	return data;
+}
+
+static void read_hex(const char *path, struct hex *hex)
+{
+	const int buf_size = 512 + 11 + 10;
+	char buf[buf_size];
+	int line = 1;
+	char *p;
+	uint8_t *data;
+	size_t l;
+	uint8_t count, b, csum, type;
+	uint16_t addr;
+	unsigned int next_addr = -1;
+	FILE *fp = fopen(path, "r");
+	if (!fp)
+		die_errno("%s", path);
+
+	hex->origin = hex->len = 0;
+	hex->capacity = 512;
+	hex->data = malloc(hex->capacity);
+	if (!hex->data)
+		die_alloc();
+
+	for (;;) {
+		if (feof(fp))
+			die("%s: missing EOF record", path);
+
+		if (!fgets(buf, buf_size, fp) && ferror(fp))
+			die_errno("%s", path);
+
+		l = strlen(buf);
+		if (l < 11)
+			die("%s:%d: short line", path, line);
+
+		p = buf;
+		if (*p != ':')
+			die("%s:%d: line does not start with ':'", path, line);
+
+		count = hex_byte(p += 1, path);
+		if (l < count * 2 + (size_t)11)
+			die("%s:%d: truncated line", path, line);
+
+		if (!trailing_whitespace(buf + count * 2 + 11))
+			die("%s:%d: excess characters", path, line);
+
+		csum = count;
+
+		b = hex_byte(p += 2, path);
+		addr = hex_byte(p += 2, path);
+		csum += b + addr;
+		addr |= (uint16_t)b << 8;
+
+		type = hex_byte(p += 2, path);
+		csum += type;
+		if (type == 0) {
+			/* Data record */
+			if (next_addr == (unsigned)-1) {
+				hex->origin = addr;
+			}
+			else if (addr != next_addr) {
+				if (addr < next_addr)
+					die("%s:%d: decreasing address",
+					    path, line);
+
+				memset(grow_hex(hex, addr - next_addr),
+				       0, addr - next_addr);
+			}
+
+			next_addr = addr + count;
+			data = grow_hex(hex, count);
+			while (count--) {
+				b = hex_byte(p += 2, path);
+				*data++ = b;
+				csum += b;
+			}
+		}
+		else {
+			while (count--)
+				csum += hex_byte(p += 2, path);
+		}
+
+		if ((uint8_t)-csum != hex_byte(p += 2, path))
+			die("%s:%d: checksum error %x", path, line, csum);
+
+		if (type == 1)
+			/* EOF record */
+			break;
+
+		/* ignore other record types */
+		line++;
+	}
+
+	if (fclose(fp))
+		die_errno("closing \"%s\"", path);
+}
+
+static void load_page(int spidev, uint8_t *data, unsigned int len)
+{
+	unsigned int i = 0;
+	uint8_t tx[4], rx[4];
+
+	tx[1] = 0;
+
+	while (len) {
+		/* program data holds little-endian words */
+		tx[0] = 0x40;
+		tx[2] = i++;
+		tx[3] = *data++;
+		do_instruction(spidev, tx, rx);
+
+		tx[0] = 0x48;
+		tx[3] = *data++;
+		do_instruction(spidev, tx, rx);
+
+		len -= 2;
+	}
+}
+
+static void write_program_page(int spidev, unsigned int addr)
+{
+	uint8_t tx[4], rx[4];
+	int i;
+
+	/* addr is in bytes, so need to divide by 2 */
+	tx[0] = 0x4c;
+	tx[1] = addr >> 9;
+	tx[2] = addr >> 1;
+	tx[3] = 0;
+
+	do_instruction(spidev, tx, rx);
+
+	/* Wait until the Flash write is completed. */
+	tx[0] = 0xf0;
+	tx[1] = tx[2] = tx[3] = 0;
+
+	for (i = 0; i < 100; i++) {
+		usleep(1000);
+		do_instruction(spidev, tx, rx);
+		if (!(rx[3] & 1))
+			return;
+	}
+
+	die("Timed out waiting for program memory page write to complete");
+}
+
+static void write_program(int spidev, struct hex *hex)
+{
+	const unsigned int page_len = 128;
+	unsigned int addr, len;
+	uint8_t *data;
+
+	if (hex->len & 1)
+		die("Program is not a whole number of words");
+
+	addr = hex->origin;
+	if (addr & (page_len - 1))
+		die("Program does not start on page boundary");
+
+	fprintf(stderr, "Writing program: ");
+
+	len = hex->len;
+	data = hex->data;
+
+	while (len >= page_len) {
+		load_page(spidev, data, page_len);
+		write_program_page(spidev, addr);
+		putc('.', stderr);
+		data += page_len;
+		len -= page_len;
+		addr += page_len;
+	}
+
+	if (len) {
+		load_page(spidev, data, len);
+		write_program_page(spidev, addr);
+		putc('.', stderr);
+	}
+
+	putc('\n', stderr);
+}
+
 int main(int argc, char **argv)
 {
 	int spidev;
+	struct hex hex;
 	uint8_t tx[4], rx[4];
 
-	(void)argc;
-	(void)argv;
+	if (argc != 2)
+		die("usage: %s <hex file>", argv[0]);
+
+	read_hex(argv[1], &hex);
 
 	spidev = init_spidev();
 
@@ -172,6 +424,7 @@ int main(int argc, char **argv)
 	fprintf(stderr, "Signature: %02x %02x %02x %02x\n",
 		rx[0], rx[1], rx[2], rx[3]);
 
+	write_program(spidev, &hex);
 	close(spidev);
 	return 0;
 }
