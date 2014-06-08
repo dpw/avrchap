@@ -47,8 +47,8 @@ static void die_alloc()
 	exit(1);
 }
 
-static void write_file(const char *path, int ignore_ebusy,
-		       const char *fmt, ...)
+static int write_file(const char *path, int ignore_ebusy,
+		      const char *fmt, ...)
 {
         va_list ap;
 	int res;
@@ -62,21 +62,51 @@ static void write_file(const char *path, int ignore_ebusy,
         res = vfprintf(fp, fmt, ap);
         va_end(ap);
 	if (res < 0 && !(errno == EBUSY  && ignore_ebusy))
-		goto err;
+		goto err_close;
 
 	action = "closing";
 	if (fclose(fp) && !(errno == EBUSY && ignore_ebusy))
 		goto err;
 
-	return;
+	return 1;
 
+ err_close:
+	fclose(fp);
  err:
-	die_errno("%s \"%s\"", action, path);
+	fprintf(stderr, "%s \"%s\"\n", action, path);
+	return 0;
 }
 
 static void unexport(void)
 {
 	write_file("/sys/class/gpio/unexport", 0, "%d\n", 8);
+}
+
+static int resetn_low(void)
+{
+	if (!write_file("/sys/class/gpio/export", 1, "8\n"))
+		goto err;
+
+	atexit(unexport);
+
+	if (!write_file("/sys/class/gpio/gpio8/direction", 0, "out\n"))
+		goto err;
+
+	/* Positive pulse on RESETn */
+	if (!write_file("/sys/class/gpio/gpio8/value", 0, "1\n"))
+		goto err;
+
+	usleep(1000);
+
+	if (!write_file("/sys/class/gpio/gpio8/value", 0, "0\n"))
+		goto err;
+
+	/* Wait at least 20ms with RESETn low before programming. */
+	usleep(25000);
+	return 1;
+
+ err:
+	return 0;
 }
 
 static int init_spidev(void)
@@ -432,7 +462,7 @@ static void verify_program(int spidev, struct hex *hex)
 
 int main(int argc, char **argv)
 {
-	int spidev;
+	int spidev = 0;
 	struct hex hex;
 	uint8_t tx[4], rx[4];
 
@@ -443,20 +473,11 @@ int main(int argc, char **argv)
 
 	spidev = init_spidev();
 
-	write_file("/sys/class/gpio/export", 1, "8\n");
-	atexit(unexport);
-	write_file("/sys/class/gpio/gpio8/direction", 0, "out\n");
-
-	/* Positive pulse on RESETn */
-	write_file("/sys/class/gpio/gpio8/value", 0, "1\n");
-	usleep(1000);
-	write_file("/sys/class/gpio/gpio8/value", 0, "0\n");
-
-	/* Wait at least 20ms with RESETn low. */
-	usleep(25000);
+	if (!resetn_low())
+		goto err;
 
 	/* Try "Programming Enable" */
-	tx[0] = 0xAC;
+	tx[0] = 0xac;
 	tx[1] = 0x53;
 	tx[2] = tx[3] = 0;
 	do_instruction(spidev, tx, rx);
@@ -474,6 +495,9 @@ int main(int argc, char **argv)
 	verify_program(spidev, &hex);
 	close(spidev);
 	return 0;
+
+ err:
+	return 1;
 }
 
 
