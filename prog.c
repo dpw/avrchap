@@ -47,6 +47,21 @@ static void die_alloc()
 	exit(1);
 }
 
+static void print_errno(const char *fmt, ...)
+	__attribute__ ((format (printf, 1, 2)));
+
+static void print_errno(const char *fmt, ...)
+{
+        va_list ap;
+
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+
+        fprintf(stderr, ": %s\n", strerror(errno));
+        exit(1);
+}
+
 static int write_file(const char *path, int ignore_ebusy,
 		      const char *fmt, ...)
 {
@@ -117,31 +132,46 @@ static int init_spidev(void)
 	uint32_t speed;
 
 	fd = open(path, O_RDWR);
-	if (fd < 0)
-		die_errno("opening \"%s\"", path);
+	if (fd < 0) {
+		print_errno("opening \"%s\"", path);
+		goto err;
+	}
 
 	/* SCK idle low, sample on leading edge */
 	b = 0;
-	if (ioctl(fd, SPI_IOC_WR_MODE, &b) < 0)
-		die_errno("Setting SPI mode");
+	if (ioctl(fd, SPI_IOC_WR_MODE, &b) < 0) {
+		print_errno("Setting SPI mode");
+		goto err_close;
+	}
 
 	/* MSB first */
 	b = 0;
-	if (ioctl(fd, SPI_IOC_WR_LSB_FIRST, &b) < 0)
-		die_errno("Setting SPI LSB-first");
+	if (ioctl(fd, SPI_IOC_WR_LSB_FIRST, &b) < 0) {
+		print_errno("Setting SPI LSB-first");
+		goto err_close;
+	}
 
 	/* 8 bits per word */
 	b = 0;
-	if (ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &b) < 0)
-		die_errno("Setting SPI bits-per-word");
+	if (ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &b) < 0) {
+		print_errno("Setting SPI bits-per-word");
+		goto err_close;
+	}
 
 	/* ATMEGAs ship with 1MHz CPU clock, SCK period should be at
 	   least 4 CPU cycles, hence 200kHz */
 	speed = 200000;
-	if (ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0)
-		die_errno("Setting SPI speed");
+	if (ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+		print_errno("Setting SPI speed");
+		goto err_close;
+	}
 
 	return fd;
+
+ err_close:
+	close(fd);
+ err:
+	return -1;
 }
 
 static void do_instruction(int fd, uint8_t tx[4], uint8_t rx[4])
@@ -189,7 +219,7 @@ static unsigned int hex_digit(unsigned char c, const char *path)
 			return uc - 'A' + 10;
 	}
 
-	die_errno("bad hex digit '%c' in \"%s\"", c, path);
+	die("bad hex digit '%c' in \"%s\"", c, path);
 }
 
 static uint8_t hex_byte(const char *s, const char *path)
@@ -472,6 +502,8 @@ int main(int argc, char **argv)
 	read_hex(argv[1], &hex);
 
 	spidev = init_spidev();
+	if (spidev < 0)
+		goto err;
 
 	if (!resetn_low())
 		goto err;
