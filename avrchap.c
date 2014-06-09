@@ -181,6 +181,35 @@ static int do_instruction(int fd, uint8_t tx[4], uint8_t rx[4])
 	return 0;
 }
 
+static int enable_programming(void)
+{
+	uint8_t tx[4], rx[4];
+	int spidev = init_spidev();
+	if (spidev < 0)
+		return -1;
+
+	if (!resetn_low())
+		goto err;
+
+	/* Try "Programming Enable" */
+	tx[0] = 0xac;
+	tx[1] = 0x53;
+	tx[2] = tx[3] = 0;
+	if (!do_instruction(spidev, tx, rx))
+		goto err;
+
+	if (rx[2] == 0x53)
+		return spidev;
+
+	fprintf(stderr,
+		"Unacknowledged 'Programming Enable' instruction "
+		"(%02x %02x %02x %02x)\n",
+		rx[0], rx[1], rx[2], rx[3]);
+ err:
+	close(spidev);
+	return -1;
+}
+
 static int read_signature(int fd, uint8_t sig[4])
 {
 	uint8_t tx[4], rx[4];
@@ -569,9 +598,9 @@ static int verify_program(int spidev, struct hex *hex)
 
 int main(int argc, char **argv)
 {
-	int spidev = 0;
+	int spidev;
 	struct hex hex;
-	uint8_t tx[4], rx[4];
+	uint8_t sig[4];
 
 	hex.data = NULL;
 
@@ -583,33 +612,15 @@ int main(int argc, char **argv)
 	if (!read_hex(argv[1], &hex))
 		goto err;
 
-	spidev = init_spidev();
+	spidev = enable_programming();
 	if (spidev < 0)
 		goto err;
 
-	if (!resetn_low())
-		goto err_close_spidev;
-
-	/* Try "Programming Enable" */
-	tx[0] = 0xac;
-	tx[1] = 0x53;
-	tx[2] = tx[3] = 0;
-	if (!do_instruction(spidev, tx, rx))
-		goto err_close_spidev;
-
-	if (rx[2] != 0x53) {
-		fprintf(stderr,
-			"Unacknowledged 'Programming Enable' instruction "
-			"(%02x %02x %02x %02x)\n",
-			rx[0], rx[1], rx[2], rx[3]);
-		goto err_close_spidev;
-	}
-
-	if (!read_signature(spidev, rx))
+	if (!read_signature(spidev, sig))
 		goto err_close_spidev;
 
 	fprintf(stderr, "Signature: %02x %02x %02x %02x\n",
-		rx[0], rx[1], rx[2], rx[3]);
+		sig[0], sig[1], sig[2], sig[3]);
 
 	if (!write_program(spidev, &hex)
 	    || !verify_program(spidev, &hex))
