@@ -596,21 +596,39 @@ static int verify_program(int spidev, struct hex *hex)
 	return 0;
 }
 
+static void usage(const char *name)
+{
+	fprintf(stderr, "Usage: %s [ -p <hex file> ]\n", name);
+}
+
 int main(int argc, char **argv)
 {
 	int spidev;
 	struct hex hex;
 	uint8_t sig[4];
+	int c;
 
 	hex.data = NULL;
 
-	if (argc != 2) {
-		print_err("usage: %s <hex file>", argv[0]);
-		goto err;
+	while ((c = getopt(argc, argv, "p:")) != -1) {
+		switch (c) {
+		case 'p':
+			if (hex.data) {
+				print_err("Can only use the -p option once");
+				goto err;
+			}
+
+			if (!read_hex(optarg, &hex))
+				goto err;
+
+			break;
+		}
 	}
 
-	if (!read_hex(argv[1], &hex))
+	if (optind != argc) {
+		usage(argv[0]);
 		goto err;
+	}
 
 	spidev = enable_programming();
 	if (spidev < 0)
