@@ -82,16 +82,21 @@ static void unexport(void)
 	write_file("/sys/class/gpio/unexport", 0, "%d\n", 8);
 }
 
-static int resetn_low(void)
+static int gpio_init(void)
 {
 	if (!write_file("/sys/class/gpio/export", 1, "8\n"))
-		goto err;
+		return 0;
 
 	atexit(unexport);
 
 	if (!write_file("/sys/class/gpio/gpio8/direction", 0, "out\n"))
-		goto err;
+		return 0;
 
+	return 1;
+}
+
+static int resetn_low(void)
+{
 	/* Positive pulse on RESETn */
 	if (!write_file("/sys/class/gpio/gpio8/value", 0, "1\n"))
 		goto err;
@@ -174,40 +179,35 @@ static int do_instruction(int fd, uint8_t tx[4], uint8_t rx[4])
 		return 1;
 
 	if (res < 0)
-		print_err("SPI_IOC_MESSAGE");
+		print_errno("SPI_IOC_MESSAGE");
 	else
 		print_err("short response from SPI_IOC_MESSAGE");
 
 	return 0;
 }
 
-static int enable_programming(void)
+static int enable_programming(int spidev)
 {
 	uint8_t tx[4], rx[4];
-	int spidev = init_spidev();
-	if (spidev < 0)
-		return -1;
 
 	if (!resetn_low())
-		goto err;
+		return 0;
 
 	/* Try "Programming Enable" */
 	tx[0] = 0xac;
 	tx[1] = 0x53;
 	tx[2] = tx[3] = 0;
 	if (!do_instruction(spidev, tx, rx))
-		goto err;
+		return 0;
 
 	if (rx[2] == 0x53)
-		return spidev;
+		return 1;
 
 	fprintf(stderr,
 		"Unacknowledged 'Programming Enable' instruction "
 		"(%02x %02x %02x %02x)\n",
 		rx[0], rx[1], rx[2], rx[3]);
- err:
-	close(spidev);
-	return -1;
+	return 0;
 }
 
 static int read_signature(int fd, uint8_t sig[4])
@@ -596,9 +596,67 @@ static int verify_program(int spidev, struct hex *hex)
 	return 0;
 }
 
+static int write_config_byte(int spidev, const char *name,
+			     uint8_t wr0, uint8_t wr1,
+			     uint8_t rd0, uint8_t rd1, uint8_t val)
+{
+	uint8_t tx[4], rx[4];
+
+	tx[0] = rd0;
+	tx[1] = rd1;
+	tx[2] = tx[3] = 0;
+	if (!do_instruction(spidev, tx, rx))
+		return 0;
+
+	if (rx[3] == val) {
+		fprintf(stderr, "Not writing %s; already set to 0x%x\n",
+			name, val);
+		return 1;
+	}
+
+	tx[0] = wr0;
+	tx[1] = wr1;
+	tx[2] = 0;
+	tx[3] = val;
+	if (!do_instruction(spidev, tx, rx))
+		return 0;
+
+	fprintf(stderr, "Set %s to 0x%x; verifying... ", name, val);
+
+	/* Bits are latched during programming mode */
+	if (!enable_programming(spidev))
+		return 0;
+
+	tx[0] = rd0;
+	tx[1] = rd1;
+	tx[2] = tx[3] = 0;
+	if (!do_instruction(spidev, tx, rx))
+		return 0;
+
+	if (rx[3] == val) {
+		fprintf(stderr, "ok\n");
+		return 1;
+	}
+	else {
+		fprintf(stderr, "mismatch (got 0x%x)\n", rx[3]);
+		return 0;
+	}
+}
+
 static void usage(const char *name)
 {
 	fprintf(stderr, "Usage: %s [ -p <hex file> ]\n", name);
+}
+
+static int safe_atob(const char *s)
+{
+	char *endptr;
+	long res = strtol(s, &endptr, 0);
+	if (res >= 0 && res <= 255 && !*endptr)
+		return res;
+
+	print_err("bad byte value \"%s\"", s);
+	return -1;
 }
 
 int main(int argc, char **argv)
@@ -607,10 +665,14 @@ int main(int argc, char **argv)
 	struct hex hex;
 	uint8_t sig[4];
 	int c;
+	int lock_bits = -1;
+	int fuse_bits = -1;
+	int high_fuse_bits = -1;
+	int ext_fuse_bits = -1;
 
 	hex.data = NULL;
 
-	while ((c = getopt(argc, argv, "p:")) != -1) {
+	while ((c = getopt(argc, argv, "p:F:H:E:L:")) != -1) {
 		switch (c) {
 		case 'p':
 			if (hex.data) {
@@ -622,6 +684,34 @@ int main(int argc, char **argv)
 				goto err;
 
 			break;
+
+		case 'F':
+			fuse_bits = safe_atob(optarg);
+			if (fuse_bits < 0)
+				goto err;
+
+			break;
+
+		case 'H':
+			high_fuse_bits = safe_atob(optarg);
+			if (high_fuse_bits < 0)
+				goto err;
+
+			break;
+
+		case 'E':
+			ext_fuse_bits = safe_atob(optarg);
+			if (ext_fuse_bits < 0)
+				goto err;
+
+			break;
+
+		case 'L':
+			lock_bits = safe_atob(optarg);
+			if (lock_bits < 0)
+				goto err;
+
+			break;
 		}
 	}
 
@@ -630,9 +720,13 @@ int main(int argc, char **argv)
 		goto err;
 	}
 
-	spidev = enable_programming();
+	spidev = init_spidev();
 	if (spidev < 0)
 		goto err;
+
+	if (!gpio_init()
+	    || !enable_programming(spidev))
+		goto err_close_spidev;
 
 	if (!read_signature(spidev, sig))
 		goto err_close_spidev;
@@ -640,8 +734,30 @@ int main(int argc, char **argv)
 	fprintf(stderr, "Signature: %02x %02x %02x %02x\n",
 		sig[0], sig[1], sig[2], sig[3]);
 
-	if (!write_program(spidev, &hex)
-	    || !verify_program(spidev, &hex))
+	if (hex.data) {
+		if (!write_program(spidev, &hex)
+		    || !verify_program(spidev, &hex))
+			goto err_close_spidev;
+	}
+
+	if (fuse_bits >= 0
+	    && !write_config_byte(spidev, "fuse bits",
+				  0xac, 0xa0, 0x50, 0, fuse_bits))
+		goto err_close_spidev;
+
+	if (high_fuse_bits >= 0
+	    && !write_config_byte(spidev, "high fuse bits",
+				  0xac, 0xa8, 0x58, 0x08, high_fuse_bits))
+		goto err_close_spidev;
+
+	if (ext_fuse_bits >= 0
+	    && !write_config_byte(spidev, "extended fuse bits",
+				  0xac, 0xa4, 0x50, 0x08, ext_fuse_bits | 0xf8))
+		goto err_close_spidev;
+
+	if (lock_bits >= 0
+	    && !write_config_byte(spidev, "lock bits",
+				  0xac, 0xe0, 0x58, 0, lock_bits | 0xc0))
 		goto err_close_spidev;
 
 	close(spidev);
