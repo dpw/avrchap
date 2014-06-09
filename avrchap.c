@@ -13,34 +13,6 @@
 
 #include <linux/spi/spidev.h>
 
-static void die(const char *fmt, ...)
-	__attribute__ ((noreturn,format (printf, 1, 2)));
-static void die_errno(const char *fmt, ...)
-	__attribute__ ((noreturn,format (printf, 1, 2)));
-
-static void die(const char *fmt, ...)
-{
-        va_list ap;
-
-        va_start(ap, fmt);
-        vfprintf(stderr, fmt, ap);
-        va_end(ap);
-	putc('\n', stderr);
-        exit(1);
-}
-
-static void die_errno(const char *fmt, ...)
-{
-        va_list ap;
-
-        va_start(ap, fmt);
-        vfprintf(stderr, fmt, ap);
-        va_end(ap);
-
-        fprintf(stderr, ": %s\n", strerror(errno));
-        exit(1);
-}
-
 static void die_alloc()
 {
 	fprintf(stderr, "failed to allocate memory\n");
@@ -187,7 +159,7 @@ static int init_spidev(void)
 	return -1;
 }
 
-static void do_instruction(int fd, uint8_t tx[4], uint8_t rx[4])
+static int do_instruction(int fd, uint8_t tx[4], uint8_t rx[4])
 {
 	struct spi_ioc_transfer xfer;
 	int res;
@@ -198,14 +170,18 @@ static void do_instruction(int fd, uint8_t tx[4], uint8_t rx[4])
 	xfer.len = 4;
 
 	res = ioctl(fd, SPI_IOC_MESSAGE(1), &xfer);
-	if (res < 0)
-		die_errno("SPI_IOC_MESSAGE");
+	if (res == 4)
+		return 1;
 
-	if (res < 4)
-		die("short response from SPI_IOC_MESSAGE");
+	if (res < 0)
+		print_err("SPI_IOC_MESSAGE");
+	else
+		print_err("short response from SPI_IOC_MESSAGE");
+
+	return 0;
 }
 
-static void read_signature(int fd, uint8_t sig[4])
+static int read_signature(int fd, uint8_t sig[4])
 {
 	uint8_t tx[4], rx[4];
 	uint8_t i;
@@ -215,9 +191,13 @@ static void read_signature(int fd, uint8_t sig[4])
 
 	for (i = 0; i < 4; i++) {
 		tx[2] = i;
-		do_instruction(fd, tx, rx);
+		if (!do_instruction(fd, tx, rx))
+			return 0;
+
 		sig[i] = rx[3];
 	}
+
+	return 1;
 }
 
 static int hex_digit(unsigned char c, const char *path)
@@ -431,7 +411,7 @@ static int read_hex(const char *path, struct hex *hex)
 	return 0;
 }
 
-static void load_page(int spidev, uint8_t *data, unsigned int len)
+static int load_page(int spidev, uint8_t *data, unsigned int len)
 {
 	unsigned int i = 0;
 	uint8_t tx[4], rx[4];
@@ -443,17 +423,21 @@ static void load_page(int spidev, uint8_t *data, unsigned int len)
 		tx[0] = 0x40;
 		tx[2] = i++;
 		tx[3] = *data++;
-		do_instruction(spidev, tx, rx);
+		if (!do_instruction(spidev, tx, rx))
+			return 0;
 
 		tx[0] = 0x48;
 		tx[3] = *data++;
-		do_instruction(spidev, tx, rx);
+		if (!do_instruction(spidev, tx, rx))
+			return 0;
 
 		len -= 2;
 	}
+
+	return 1;
 }
 
-static void write_program_page(int spidev, unsigned int addr)
+static int write_program_page(int spidev, unsigned int addr)
 {
 	uint8_t tx[4], rx[4];
 	int i;
@@ -464,7 +448,8 @@ static void write_program_page(int spidev, unsigned int addr)
 	tx[2] = addr >> 1;
 	tx[3] = 0;
 
-	do_instruction(spidev, tx, rx);
+	if (!do_instruction(spidev, tx, rx))
+		return 0;
 
 	/* Wait until the Flash write is completed. */
 	tx[0] = 0xf0;
@@ -472,15 +457,19 @@ static void write_program_page(int spidev, unsigned int addr)
 
 	for (i = 0; i < 100; i++) {
 		usleep(1000);
-		do_instruction(spidev, tx, rx);
+
+		if (!do_instruction(spidev, tx, rx))
+			return 0;
+
 		if (!(rx[3] & 1))
-			return;
+			return 1;
 	}
 
-	die("Timed out waiting for program memory page write to complete");
+	print_err("Time out waiting for program memory page write to complete");
+	return 0;
 }
 
-static void write_program(int spidev, struct hex *hex)
+static int write_program(int spidev, struct hex *hex)
 {
 	const unsigned int page_len = 128;
 	unsigned int addr, len;
@@ -488,18 +477,24 @@ static void write_program(int spidev, struct hex *hex)
 
 	data = hex->data;
 	len = hex->len;
-	if (len & 1)
-		die("Program is not a whole number of words");
+	if (len & 1) {
+		print_err("Program is not a whole number of words");
+		return 0;
+	}
 
 	addr = hex->origin;
-	if (addr & (page_len - 1))
-		die("Program does not start on page boundary");
+	if (addr & (page_len - 1)) {
+		print_err("Program does not start on page boundary");
+		return 0;
+	}
 
 	fprintf(stderr, "Writing program: ");
 
 	while (len >= page_len) {
-		load_page(spidev, data, page_len);
-		write_program_page(spidev, addr);
+		if (!load_page(spidev, data, page_len)
+		    || !write_program_page(spidev, addr))
+			return 0;
+
 		putc('.', stderr);
 		data += page_len;
 		len -= page_len;
@@ -507,15 +502,18 @@ static void write_program(int spidev, struct hex *hex)
 	}
 
 	if (len) {
-		load_page(spidev, data, len);
-		write_program_page(spidev, addr);
+		if (!load_page(spidev, data, len)
+		    || !write_program_page(spidev, addr))
+			return 0;
+
 		putc('.', stderr);
 	}
 
 	putc('\n', stderr);
+	return 1;
 }
 
-static void verify_program(int spidev, struct hex *hex)
+static int verify_program(int spidev, struct hex *hex)
 {
 	unsigned int addr, len;
 	uint8_t *data;
@@ -523,8 +521,10 @@ static void verify_program(int spidev, struct hex *hex)
 
 	data = hex->data;
 	len = hex->len;
-	if (len & 1)
-		die("Program is not a whole number of words");
+	if (len & 1) {
+		print_err("Program is not a whole number of words");
+		return 0;
+	}
 
 	addr = hex->origin;
 
@@ -538,14 +538,18 @@ static void verify_program(int spidev, struct hex *hex)
 		tx[1] = addr >> 9;
 		tx[2] = addr >> 1;
 		tx[3] = 0;
-		do_instruction(spidev, tx, rx);
+		if (!do_instruction(spidev, tx, rx))
+			return 0;
+
 		if (rx[3] != *data)
 			goto mismatch;
 
 		data++;
 		addr++;
 		tx[0] = 0x28;
-		do_instruction(spidev, tx, rx);
+		if (!do_instruction(spidev, tx, rx))
+			return 0;
+
 		if (rx[3] != *data)
 			goto mismatch;
 
@@ -555,11 +559,12 @@ static void verify_program(int spidev, struct hex *hex)
 	}
 
 	putc('\n', stderr);
-	return;
+	return 1;
 
  mismatch:
-	die("\nVerification error: Expected %x, got %x at address %x",
-	    *data, rx[3], addr);
+	print_err("\nVerification error: Expected %x, got %x at address %x",
+		  *data, rx[3], addr);
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -589,7 +594,9 @@ int main(int argc, char **argv)
 	tx[0] = 0xac;
 	tx[1] = 0x53;
 	tx[2] = tx[3] = 0;
-	do_instruction(spidev, tx, rx);
+	if (!do_instruction(spidev, tx, rx))
+		goto err_close_spidev;
+
 	if (rx[2] != 0x53) {
 		fprintf(stderr,
 			"Unacknowledged 'Programming Enable' instruction "
@@ -598,12 +605,16 @@ int main(int argc, char **argv)
 		goto err_close_spidev;
 	}
 
-	read_signature(spidev, rx);
+	if (!read_signature(spidev, rx))
+		goto err_close_spidev;
+
 	fprintf(stderr, "Signature: %02x %02x %02x %02x\n",
 		rx[0], rx[1], rx[2], rx[3]);
 
-	write_program(spidev, &hex);
-	verify_program(spidev, &hex);
+	if (!write_program(spidev, &hex)
+	    || !verify_program(spidev, &hex))
+		goto err_close_spidev;
+
 	close(spidev);
 	return 0;
 
