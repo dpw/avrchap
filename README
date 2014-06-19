@@ -1,0 +1,60 @@
+# A tool for programming ATmega microcontrollers using a Raspberry Pi
+
+avrchap writes to the Flash program memory of an Atmal ATmega
+microcontroller from a Raspberry Pi.  In can be used to write a
+bootloader to an ATmega (e.g. the optiboot bootloader used by
+Arduino).  It's based on the datasheet that covers the ATmega48A,
+48PA, 88A, 88PA, 168A, 168PA, 328, 328P, so should work with that
+range, but was developed and tested with the 328PU.
+
+It uses the "Serial Downloading" programming mode of the ATmega.  This
+is based on
+[SPI](http://en.wikipedia.org/wiki/Serial_Peripheral_Interface_Bus),
+so it's a natural fit for the SPI bus available on the Raspberry Pi's
+GPIO header.
+
+After I wrote this, I found that there is [a fork of avrdude that does
+the same
+thing](http://kevincuzner.com/2013/05/27/raspberry-pi-as-an-avr-programmer/).
+You might want to use that instead.  But avrchap is easier to build
+because it doesn't have any dependencies, and it is an example of how
+to use the Raspberry Pi's SPI bus from C, so here it is.
+
+## Connecting the Raspberry Pi to an ATmega for programming
+
+WARNING: I'm new to this stuff. It worked for me, but it's easy to
+make mistakes that could fry your Raspberry Pi or ATmega or both. You
+might want to double-check my working here.
+
+With that said, it's pretty simple.  ATmega pin numbers assume the 28
+PDIP package.
+
+| RPi GPIO header pin | ATmega pin |
+|---------------------|------------|
+| 17 (3V3)            | 7 (VCC)    |
+| 17 (3V3)            | 20 (AVCC)  |
+| 19 (SPI_MOSI)       | 17 (MOSI)  |
+| 21 (SPI_MISO)       | 18 (MISO)  |
+| 23 (SPI_SCLK)       | 19 (SCLK)  |
+| 24 (SPI_CE0_N)      | 1 (RESET#) |
+| 25 (GND)            | 8 (GND)    |
+
+The factory setting for ATmega fuses selects the internal oscillator,
+so it shouldn't be necessary to connect an external oscillator unless
+you changed the fuses settings already.
+
+## Usage
+
+To build, simply do:
+
+    $ make
+
+As root, use the `-p` option to write a HEX file to the program memory:
+
+    $ sudo ./avrchap -p optiboot_atmega328.hex
+
+And the `-F`, `-H`, `-E` and `-L` options to set the fuse bits, the
+high fuse bits, the extended fuse bits, and the lock bits,
+respectively:
+
+    $ sudo ./avrchap -F 0xff -H 0xde -E 0x05 -L 0x0f
